@@ -1,191 +1,75 @@
-# Conveyor — Order Pipeline for Northline Trade Supplies
+# Conveyor — Phase 1 Specification
 
-**Client:** Northline Trade Supplies Ltd, Leeds. B2B wholesaler of electrical and plumbing supplies to tradespeople.
-**Channels:** 40 trade counters, a mobile app, and a phone desk for account customers.
-**Volume:** ~12,000 orders/day, with a sharp spike 06:30–08:00 when tradespeople order from the van before their first job.
+Northline Trade Supplies Ltd
+Version 1.0 — 17 October 2026
 
-## Background
+## 1. Background
 
-Northline's current order system (OMS) is a ten-year-old monolith. Placing an order is a single synchronous HTTP request that checks stock, takes payment, persists the order and notifies the warehouse, all in one transaction. Three recurring production problems:
+Northline is a B2B wholesaler of electrical and plumbing supplies, selling to tradespeople via 40 trade counters, a mobile app and a phone desk. Volume is approximately 12,000 orders per day, concentrated between 06:30 and 08:00.
 
-1. **Morning spike outages.** Payment-provider latency backs up the request pipeline and trade-counter tills freeze.
-2. **Cascading failures.** When the warehouse system is slow, orders fail even though stock and payment succeeded. Stock is frequently left reserved for orders that never completed.
-3. **No live revenue.** Finance's "revenue today" view is a nightly batch; nobody knows how the day is going until the next morning.
+The existing order system (OMS) processes each order as a single synchronous transaction: stock check, payment, order record, warehouse notification. This causes:
 
-Northline's head of engineering has selected Kafka. Conveyor is the replacement pipeline: order placement must be fast and never blocked by downstream systems; stock reservation, payment and warehouse notification must run and fail independently; finance must get revenue figures within a minute of an order confirming.
+- Outages when the payment provider is slow, blocking all order intake.
+- Stock left reserved when payment fails, with no release.
+- No real-time revenue reporting; figures are produced by nightly batch.
 
-## Delivery phases
+OMS is to be replaced by an event-driven system on Kafka, named Conveyor.
 
-| Phase | Deliverable |
-|-------|-------------|
-| 1 | Reference implementation of the business flow over plain HTTP, so the domain is agreed before going event-driven. **This document.** |
-| 2 | Replace HTTP calls with Kafka, one hop at a time. Fix the stuck-reservation defect with compensating events. |
-| 3 | Avro + Schema Registry; retry and dead-letter handling for the payment provider. |
-| 4 | Kafka Streams service feeding a live revenue-per-minute view for finance. |
-| 5 | Docker Compose for the full stack; Testcontainers integration tests. |
+## 2. Phase 1 objective
 
-Stack: Java 21, Spring Boot 3.x, Maven, H2, Redis.
+Deliver the order flow as three independent services communicating over HTTP. Kafka is not introduced in this phase. The objective is to fix the service boundaries, data ownership and business rules so that phase 2 replaces the transport without changing the logic.
 
----
+Requirements:
 
-## 1. Scope of phase 1
+- Runs locally with no cloud dependencies.
+- Each service is independently buildable, runnable and deployable.
+- Each service owns its data exclusively. No shared database.
+- The order service is the only service exposed to clients (app, tills, phone desk).
 
-Three services that talk to each other over HTTP. When the four acceptance checks in §7 pass, phase 1 is done.
+## 3. Business rules
 
-Build order (each depends on the previous):
+1. Stock reservation is all-or-nothing per order.
+2. The order total is calculated by the order service from catalogue prices. Prices submitted by clients are ignored.
+3. A failed payment rejects the order. There is no pending-payment state.
+4. An order is charged at most once.
+5. Every rejected order carries a reason.
 
-1. `inventory-service` — stands alone, calls nothing.
-2. `payment-service` — stands alone, calls nothing.
-3. `order-service` — calls the other two, so build it last.
+## 4. Order flow
 
-Payloads below are fixed. In phase 2 the same shapes become Kafka message bodies, so matching them now makes the swap mechanical.
+1. Order service receives the order and records it as `PLACED`.
+2. Order service requests a reservation from the inventory service.
+   - Rejected → order status `REJECTED` with reason. Stop.
+   - Reserved → order status `STOCK_RESERVED`.
+3. Order service requests payment from the payment service.
+   - Failed → order status `REJECTED` with reason. Stop.
+   - Paid → order status `CONFIRMED`.
+4. Order service returns the final order to the client.
 
----
+Known limitation, accepted for phase 1: a payment failure at step 3 leaves stock reserved. This reproduces the OMS defect and is resolved in phase 2 by the event-driven design. It must not be fixed in phase 1.
 
-## 2. Project layout
+## 5. Services
 
-One Maven parent POM (`<packaging>pom</packaging>`) with three modules, each a runnable Spring Boot application.
+### 5.1 Order service
 
-| Module              | Port | Storage          | Spring starters                               |
-|---------------------|------|------------------|-----------------------------------------------|
-| `order-service`     | 8081 | H2 (JPA)         | web, data-jpa, h2, validation                 |
-| `inventory-service` | 8082 | Redis            | web, data-redis, validation                   |
-| `payment-service`   | 8083 | H2 (JPA) + Redis | web, data-jpa, h2, data-redis, validation     |
+Responsibility: accept orders from clients, coordinate the flow in §4, hold the order record.
 
-Redis: `docker run -p 6379:6379 redis:7`. This is the only container in phase 1.
+Owns: orders and order lines.
 
-Suggested package layout per module: `com.northline.conveyor.<service>` with sub-packages `api` (controllers, DTOs), `domain` (entities, business logic) and, in order-service only, `client`.
+Enforces: rules 2 and 5.
 
-No shared `common` module in phase 1. Duplicate the handful of DTOs across services; whether a shared contracts module is worth it is a phase 2 decision.
+API (client-facing, agreed with the app and till teams; fixed):
 
----
-
-## 3. Shared data shapes
-
-- IDs: UUID strings, generated by the service that owns the record.
-- Money: `BigDecimal`, GBP, two decimal places, serialised as a JSON number.
-- Timestamps: ISO-8601 UTC (`java.time.Instant`).
-
-### OrderItem
-
-```json
-{ "productId": "SKU-001", "quantity": 2, "unitPrice": 19.99 }
-```
-
-### Order status
-
-```
-PLACED → STOCK_RESERVED → CONFIRMED
-   └──────────┴──────────→ REJECTED   (with rejectionReason)
-```
-
-### Seed catalogue
-
-Loaded into inventory on startup. SKU-004 (zero stock) and SKU-003 (three units) exist to exercise the rejection path.
-
-| productId | name     | unitPrice (GBP) | starting stock |
-|-----------|----------|-----------------|----------------|
-| SKU-001   | Keyboard | 49.99           | 10             |
-| SKU-002   | Mouse    | 19.99           | 25             |
-| SKU-003   | Monitor  | 199.00          | 3              |
-| SKU-004   | Headset  | 79.50           | 0              |
-| SKU-005   | Webcam   | 59.00           | 5              |
-
----
-
-## 4. inventory-service (8082)
-
-Stock count per product lives in Redis at key `stock:<productId>` as an integer. Seed the catalogue on startup only if the key is absent, so restarts don't reset stock.
-
-### `POST /reservations`
-
-Reserve stock for an entire order. All-or-nothing: if any line can't be fulfilled, nothing is reserved.
+`POST /orders`
 
 Request:
 
 ```json
 {
-  "orderId": "7c1a…",
-  "items": [
-    { "productId": "SKU-001", "quantity": 2 },
-    { "productId": "SKU-003", "quantity": 1 }
-  ]
-}
-```
-
-Response `200` (success):
-
-```json
-{ "orderId": "7c1a…", "status": "RESERVED" }
-```
-
-Response `200` (business rejection — not a 4xx):
-
-```json
-{ "orderId": "7c1a…", "status": "REJECTED", "reason": "Insufficient stock for SKU-004" }
-```
-
-Implementation note: `DECRBY` per line; if the result is negative, `INCRBY` it back and reject (and revert any lines already decremented). This is not atomic across lines. That's acceptable in phase 1 and worth being able to explain; the proper fix is a Lua script or `MULTI`/`EXEC`, optional later.
-
-### `GET /stock/{productId}`
-
-```json
-{ "productId": "SKU-001", "available": 8 }
-```
-
-Diagnostic only.
-
----
-
-## 5. payment-service (8083)
-
-H2 entity `Payment`: `id`, `orderId`, `amount`, `status` (`PAID` | `FAILED`), `createdAt`.
-
-### `POST /payments`
-
-Request:
-
-```json
-{ "orderId": "7c1a…", "amount": 299.97 }
-```
-
-Response `200`:
-
-```json
-{ "paymentId": "e4b2…", "orderId": "7c1a…", "status": "PAID" }
-```
-
-or
-
-```json
-{ "paymentId": "e4b2…", "orderId": "7c1a…", "status": "FAILED", "reason": "Card declined" }
-```
-
-Fail at random. Rate is a config property, default `payment.failure-rate=0.2`; set to `0` or `1` when testing.
-
-**Duplicate check (required).** Before processing, run `SET payment:processed:<orderId> 1 NX EX 86400` in Redis. If the key already existed, do not charge again; return the existing `Payment` from H2. Nothing triggers this path in phase 1. It becomes essential in phase 2.
-
-### `GET /payments/{orderId}`
-
-The payment for that order, `404` if none. Diagnostic only.
-
----
-
-## 6. order-service (8081)
-
-H2 entity `Order`: `id`, `customerId`, `items` (one-to-many `OrderItem`), `totalAmount`, `status`, `rejectionReason`, `createdAt`, `updatedAt`. `totalAmount` is computed server-side from the items; never trusted from the client.
-
-### `POST /orders`
-
-Request:
-
-```json
-{
-  "customerId": "cust-42",
-  "items": [
-    { "productId": "SKU-001", "quantity": 2, "unitPrice": 49.99 },
-    { "productId": "SKU-003", "quantity": 1, "unitPrice": 199.00 }
-  ]
+   "customerId": "cust-42",
+   "items": [
+      { "productId": "SKU-001", "quantity": 2 },
+      { "productId": "SKU-002", "quantity": 1 }
+   ]
 }
 ```
 
@@ -193,73 +77,138 @@ Response `201`:
 
 ```json
 {
-  "orderId": "7c1a…",
-  "customerId": "cust-42",
-  "items": [ { "productId": "SKU-001", "quantity": 2, "unitPrice": 49.99 }, … ],
-  "totalAmount": 298.98,
-  "status": "CONFIRMED",
-  "rejectionReason": null,
-  "createdAt": "2026-10-16T18:30:00Z"
+   "orderId": "<uuid>",
+   "customerId": "cust-42",
+   "items": [
+      { "productId": "SKU-001", "quantity": 2, "unitPrice": 49.99 },
+      { "productId": "SKU-002", "quantity": 1, "unitPrice": 19.99 }
+   ],
+   "totalAmount": 119.97,
+   "status": "CONFIRMED",
+   "rejectionReason": null,
+   "createdAt": "2026-10-17T07:12:04Z"
 }
 ```
 
-### Order flow
+`status` is one of `PLACED`, `STOCK_RESERVED`, `CONFIRMED`, `REJECTED`. `rejectionReason` is null unless status is `REJECTED`.
 
-Single service method:
+`GET /orders/{orderId}` — returns the same representation. `404` if not found.
 
-1. Persist with status `PLACED`.
-2. Call inventory `POST /reservations`. On `REJECTED` → status `REJECTED`, store reason, persist, return.
-3. Status `STOCK_RESERVED`, persist.
-4. Call payment `POST /payments` with `totalAmount`. On `FAILED` → status `REJECTED`, store reason, persist, return.
-5. Status `CONFIRMED`, persist, return.
+Validation: `customerId` required; `items` non-empty; `quantity` ≥ 1; unknown `productId` → `400`.
 
-**Known defect, intentionally kept:** a payment failure at step 4 leaves stock reserved with no compensating release. This is Northline's production problem #2 reproduced faithfully. Do not fix it in phase 1; fixing it with compensating events is the centrepiece of phase 2.
+### 5.2 Inventory service
 
-### `GET /orders/{id}`
+Responsibility: hold stock levels and product prices; decide whether an order can be reserved.
 
-Same shape as the `201` response; `404` if missing.
+Owns: product catalogue (code, description, unit price) and stock on hand per product.
 
-### Client interfaces
+Enforces: rule 1.
 
-The flow depends only on these two interfaces, defined in the `client` package:
+API (internal):
 
-```java
-public interface InventoryClient {
-    ReservationResult reserve(String orderId, List<OrderItem> items);
-}
+`POST /reservations`
 
-public interface PaymentClient {
-    PaymentResult charge(String orderId, BigDecimal amount);
+Request:
+
+```json
+{
+   "orderId": "<uuid>",
+   "items": [
+      { "productId": "SKU-001", "quantity": 2 }
+   ]
 }
 ```
 
-Phase 1 implementations use Spring `RestClient` with base URLs from config:
+Response `200`, one of:
 
-```yaml
-clients:
-  inventory:
-    url: http://localhost:8082
-  payment:
-    url: http://localhost:8083
+```json
+{ "orderId": "<uuid>", "status": "RESERVED", "items": [ { "productId": "SKU-001", "quantity": 2, "unitPrice": 49.99 } ] }
 ```
 
-Phase 2 adds Kafka-backed implementations of the same interfaces; the flow code is unchanged.
+```json
+{ "orderId": "<uuid>", "status": "REJECTED", "reason": "Insufficient stock: SKU-004" }
+```
 
----
+On `REJECTED`, no stock is decremented for any line. On `RESERVED`, stock is decremented for every line and current unit prices are returned so the order service can compute the total.
 
-## 7. Acceptance checks
+`GET /stock/{productId}` — returns `{ "productId", "available" }`. Diagnostic.
 
-With all three services and Redis running:
+Startup: load the catalogue in §6 if not already present.
 
-| # | Scenario                | Input                                              | Expected                                                                 |
-|---|-------------------------|----------------------------------------------------|--------------------------------------------------------------------------|
-| 1 | Happy path              | 2× SKU-001 + 1× SKU-002, `failure-rate=0`          | `201`, `CONFIRMED`; `GET /stock/SKU-001` → 8                             |
-| 2 | Out of stock            | 1× SKU-004                                         | `201`, `REJECTED`, reason names SKU-004; other stock unchanged            |
-| 3 | Partial failure reverts | 1× SKU-001 + 1× SKU-004                            | `REJECTED`; SKU-001 stock unchanged                                       |
-| 4 | Payment fails           | any valid order, `failure-rate=1`                  | `REJECTED`, reason `Card declined`; stock **did** drop (the kept defect)  |
+### 5.3 Payment service
 
----
+Responsibility: take payment for an order; record the outcome.
 
-## 8. Out of scope for phase 1
+Owns: payments.
 
-Kafka, Docker Compose, Avro, Schema Registry, Kafka Streams, Testcontainers, authentication, a real database, retries. All deferred to later phases.
+Enforces: rules 3 and 4.
+
+API (internal):
+
+`POST /payments`
+
+Request:
+
+```json
+{ "orderId": "<uuid>", "amount": 119.97 }
+```
+
+Response `200`, one of:
+
+```json
+{ "paymentId": "<uuid>", "orderId": "<uuid>", "status": "PAID" }
+```
+
+```json
+{ "paymentId": "<uuid>", "orderId": "<uuid>", "status": "FAILED", "reason": "Card declined" }
+```
+
+If a payment already exists for `orderId`, return it without charging again.
+
+`GET /payments/{orderId}` — returns the payment for the order. `404` if none. Diagnostic.
+
+Payment provider: simulated. Fails a configurable proportion of requests; default 0.2. Must be settable to 0 and 1 for testing.
+
+### 5.4 Conventions
+
+- Identifiers: UUID strings, generated by the owning service.
+- Money: decimal, GBP, two decimal places, serialised as a JSON number.
+- Timestamps: ISO-8601, UTC.
+- Business outcomes (rejected, failed) are `200` responses with a status field. HTTP error codes are for invalid requests and system errors only.
+
+## 6. Test catalogue
+
+| productId | description | unitPrice | stock |
+|---|---|---|---|
+| SKU-001 | Keyboard | 49.99 | 10 |
+| SKU-002 | Mouse | 19.99 | 25 |
+| SKU-003 | Monitor | 199.00 | 3 |
+| SKU-004 | Headset | 79.50 | 0 |
+| SKU-005 | Webcam | 59.00 | 5 |
+
+## 7. Acceptance criteria
+
+All three services running.
+
+| # | Scenario | Input | Expected |
+|---|---|---|---|
+| 1 | Normal order | 2 × SKU-001, 1 × SKU-002; failure rate 0 | `201`, `CONFIRMED`, total 119.97; SKU-001 stock 8 |
+| 2 | Out of stock | 1 × SKU-004 | `201`, `REJECTED`, reason names SKU-004; no stock changed |
+| 3 | All-or-nothing | 1 × SKU-001, 1 × SKU-004 | `201`, `REJECTED`; SKU-001 stock unchanged |
+| 4 | Payment declined | 1 × SKU-002; failure rate 1 | `201`, `REJECTED`, reason "Card declined"; SKU-002 stock decremented (known limitation, §4) |
+| 5 | Lookup | `GET /orders/{id}` for each above | Matching representation |
+| 6 | Invalid request | empty `items` | `400` |
+
+## 8. Out of scope
+
+Kafka, warehouse notification, revenue reporting, authentication, real payment provider, containerisation, automated integration tests.
+
+## 9. Roadmap
+
+| Phase | Deliverable |
+|---|---|
+| 1 | Order flow over HTTP across three services |
+| 2 | Kafka transport between services; stuck-reservation defect resolved |
+| 3 | Payment retry and dead-letter handling; schema management |
+| 4 | Revenue-per-minute stream for finance |
+| 5 | Single-command local stack; integration test suite |
